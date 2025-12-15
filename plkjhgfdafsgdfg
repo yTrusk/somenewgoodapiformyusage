@@ -1,1 +1,269 @@
-https://ytrusk.squareweb.app/
+import express from 'express';
+import axios from 'axios';
+
+const app = express();
+const PORT = 3000;
+
+const FETCH_INTERVAL = 15000; 
+const MIN_AVAILABLE_SLOTS = 3; 
+const MAX_PLAYERS_THRESHOLD = 0.95;
+
+interface RobloxServer {
+  id: string;
+  maxPlayers: number;
+  playing: number;
+  playerTokens: string[];
+  fps: number;
+  ping: number;
+}
+
+interface RobloxApiResponse {
+  data: RobloxServer[];
+  nextPageCursor: string | null;
+}
+const PLACE = '109983668079237'
+interface ServerPool {
+  availableServers: RobloxServer[];
+  usedServers: Set<string>;
+  lastFetch: number;
+  isFetching: boolean;
+  placeId: string;
+}
+
+const serverPools = new Map<string, ServerPool>();
+
+async function fetchRobloxServersRandom(placeId: string): Promise<RobloxServer[]> {
+  const allServers: RobloxServer[] = [];
+  let cursor: string | null = null;
+  const maxPages = 10; 
+  let currentPage = 0;
+  
+  try {
+    const initialUrl = `https://games.roblox.com/v1/games/${PLACE}/servers/Public`;
+    const initialResponse = await axios.get<RobloxApiResponse>(initialUrl, {
+      params: { sortOrder: 'Desc', limit: 100 }
+    });
+    
+    allServers.push(...initialResponse.data.data);
+    cursor = initialResponse.data.nextPageCursor;
+    currentPage++;
+    
+    const skipPages = Math.floor(Math.random() * 4);
+    
+    while (cursor && currentPage < maxPages) {
+      if (currentPage <= skipPages) {
+        const skipResponse = await axios.get<RobloxApiResponse>(initialUrl, {
+          params: { sortOrder: 'Desc', limit: 100, cursor }
+        });
+        cursor = skipResponse.data.nextPageCursor;
+        currentPage++;
+        await new Promise(resolve => setTimeout(resolve, 300));
+        continue;
+      }
+      
+      const response = await axios.get<RobloxApiResponse>(initialUrl, {
+        params: { sortOrder: 'Desc', limit: 100, cursor }
+      });
+      
+      if (response.data.data && response.data.data.length > 0) {
+        allServers.push(...response.data.data);
+      }
+      
+      cursor = response.data.nextPageCursor;
+      currentPage++;
+      
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    
+    const validServers = allServers.filter(server => {
+      const availableSlots = server.maxPlayers - server.playing;
+      const occupancyRate = server.playing / server.maxPlayers;
+      
+      return availableSlots >= MIN_AVAILABLE_SLOTS && 
+             occupancyRate < MAX_PLAYERS_THRESHOLD &&
+             server.playing > 3; 
+    });
+    
+    // Embaralhar servidores
+    return validServers.sort(() => Math.random() - 0.5);
+    
+  } catch (error: any) {
+    console.error('Erro ao buscar servidores:', error.message);
+    return [];
+  }
+}
+
+async function initializeServerPool(placeId: string) {
+  if (!serverPools.has(PLACE)) {
+    serverPools.set(PLACE, {
+      availableServers: [],
+      usedServers: new Set(),
+      lastFetch: 0,
+      isFetching: false,
+      placeId: PLACE
+    });
+  }
+  
+  const pool = serverPools.get(PLACE)!;
+  
+  if (pool.availableServers.length === 0 && !pool.isFetching) {
+    await refreshServerPool(PLACE);
+  }
+}
+
+async function refreshServerPool(placeId: string) {
+  const pool = serverPools.get(PLACE);
+  if (!pool || pool.isFetching) return;
+  
+  pool.isFetching = true;
+  console.log(`[${PLACE}] Buscando novos servidores...`);
+  
+  try {
+    const servers = await fetchRobloxServersRandom(PLACE);
+    
+    pool.availableServers = servers;
+    pool.usedServers.clear();
+    pool.lastFetch = Date.now();
+    
+    console.log(`✅ [${PLACE}] ${servers.length} servidores disponíveis`);
+  } catch (error) {
+    console.error(`❌ [${PLACE}] Erro ao atualizar pool`);
+  } finally {
+    pool.isFetching = false;
+  }
+}
+
+setInterval(async () => {
+  for (const [PLACE, pool] of serverPools.entries()) {
+    const timeSinceLastFetch = Date.now() - pool.lastFetch;
+    
+    if (timeSinceLastFetch >= FETCH_INTERVAL && !pool.isFetching) {
+      console.log(`[${PLACE}] Auto-refresh iniciado`);
+      await refreshServerPool(PLACE);
+    }
+  }
+}, FETCH_INTERVAL);
+
+app.get('/server/next/:placeId', async (req, res) => {
+  const { placeId } = req.params;
+  const clientId = req.query.clientId as string || 'unknown';
+  
+  try {
+    await initializeServerPool(PLACE);
+    const pool = serverPools.get(PLACE)!;
+    
+    if (pool.availableServers.length === 0 || 
+        pool.usedServers.size >= pool.availableServers.length) {
+      console.log(`[${PLACE}] Pool esgotado, buscando novos servidores...`);
+      await refreshServerPool(PLACE);
+    }
+    
+    let selectedServer: RobloxServer | null = null;
+    
+    for (const server of pool.availableServers) {
+      if (!pool.usedServers.has(server.id)) {
+        selectedServer = server;
+        pool.usedServers.add(server.id);
+        break;
+      }
+    }
+    
+    if (!selectedServer) {
+      return res.status(503).json({
+        error: 'Nenhum servidor disponível',
+        message: 'Aguarde o próximo refresh',
+        nextRefresh: pool.lastFetch + FETCH_INTERVAL
+      });
+    }
+    
+    console.log(`📤 [${PLACE}] Servidor enviado para ${clientId}: ${selectedServer.id} (${selectedServer.playing}/${selectedServer.maxPlayers})`);
+    
+    res.json({
+      success: true,
+      server: {
+        id: selectedServer.id,
+        maxPlayers: selectedServer.maxPlayers,
+        playing: selectedServer.playing,
+        availableSlots: selectedServer.maxPlayers - selectedServer.playing,
+        fps: selectedServer.fps,
+        ping: selectedServer.ping
+      },
+      poolStatus: {
+        totalServers: pool.availableServers.length,
+        usedServers: pool.usedServers.size,
+        remainingServers: pool.availableServers.length - pool.usedServers.size,
+        lastFetch: pool.lastFetch,
+        nextRefresh: pool.lastFetch + FETCH_INTERVAL
+      },
+      joinUrl: `roblox://placeId=${PLACE}&gameInstanceId=${selectedServer.id}`
+    });
+    
+  } catch (error: any) {
+    res.status(500).json({
+      error: 'Erro ao obter servidor',
+      message: error.message
+    });
+  }
+});
+
+app.post('/server/release/:placeId/:serverId', (req, res) => {
+  const { placeId, serverId } = req.params;
+  const pool = serverPools.get(PLACE);
+  
+  if (!pool) {
+    return res.status(404).json({ error: 'Pool não encontrado' });
+  }
+  
+  pool.usedServers.delete(serverId);
+  
+  console.log(`[${PLACE}] Servidor ${serverId} liberado para reutilização`);
+  
+  res.json({ success: true, message: 'Servidor liberado' });
+});
+
+app.post('/refresh/:placeId', async (req, res) => {
+  const { placeId } = req.params;
+  
+  try {
+    await initializeServerPool(PLACE);
+    await refreshServerPool(PLACE);
+    
+    const pool = serverPools.get(PLACE)!;
+    
+    res.json({
+      success: true,
+      serversFound: pool.availableServers.length,
+      timestamp: pool.lastFetch
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      error: 'Erro ao forçar refresh',
+      message: error.message
+    });
+  }
+});
+
+app.get('/status/:placeId', (req, res) => {
+  const { placeId } = req.params;
+  const pool = serverPools.get(PLACE);
+  
+  if (!pool) {
+    return res.status(404).json({ error: 'Pool não encontrado' });
+  }
+  
+  res.json({
+    placeId: PLACE,
+    totalServers: pool.availableServers.length,
+    availableServers: pool.availableServers.length - pool.usedServers.size,
+    usedServers: pool.usedServers.size,
+    lastFetch: new Date(pool.lastFetch).toISOString(),
+    nextRefresh: new Date(pool.lastFetch + FETCH_INTERVAL).toISOString(),
+    isFetching: pool.isFetching
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`Porta: ${PORT}`);
+  console.log(`Intervalo de fetch: ${FETCH_INTERVAL / 1000}s`);
+  console.log(`Slots mínimos: ${MIN_AVAILABLE_SLOTS}`);
+});
